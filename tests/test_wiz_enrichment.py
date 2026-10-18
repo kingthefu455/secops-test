@@ -9,10 +9,12 @@ sys.path[:0] = [
     os.path.join(ROOT, "tests", "stubs"),
     os.path.join(ROOT, "WizEnrichment", "Managers"),
     os.path.join(ROOT, "WizEnrichment", "ActionsScripts"),
+    os.path.join(ROOT, "WizEnrichment", "Jobs"),
 ]
 
 import WizManager  # noqa: E402
 from SiemplifyAction import SiemplifyAction  # noqa: E402
+from SiemplifyJob import SiemplifyJob  # noqa: E402
 from SiemplifyDataModel import Entity, EntityTypes  # noqa: E402
 from ScriptResult import EXECUTION_STATE_COMPLETED, EXECUTION_STATE_FAILED  # noqa: E402
 
@@ -175,6 +177,100 @@ class EnrichHostnameActionTests(unittest.TestCase):
         message, result, status = siemplify.ended
         self.assertEqual(status, EXECUTION_STATE_FAILED)
         self.assertIn("Failed to enrich: WEB-01", message)
+
+
+ISSUE_A = "11111111-2222-3333-4444-555555555555"
+ISSUE_B = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+
+def wiz_alert(issue_id, field="ThreadId", product="Wiz", test_case="False"):
+    return {"identifier": "alert-" + issue_id[:4],
+            "additional_properties": {field: issue_id, "DeviceProduct": product, "IsTestCase": test_case}}
+
+
+class FakeWizIssues(object):
+    """Answers the issue lookup and updateIssue mutation, recording the mutations."""
+
+    def __init__(self, statuses, fail_update=()):
+        self.statuses = statuses
+        self.fail_update = fail_update
+        self.updates = []
+
+    def post(self, url, headers=None, data=None, json=None, timeout=None):
+        if url.endswith("/oauth/token"):
+            return FakeResponse({"access_token": "tok", "expires_in": 3600})
+        variables = json["variables"]
+        if "updateIssue" in json["query"]:
+            if variables["issueId"] in self.fail_update:
+                return FakeResponse({"errors": [{"message": "not allowed"}]})
+            self.updates.append(variables)
+            return FakeResponse({"data": {"updateIssue": {"issue": {
+                "id": variables["issueId"], "status": variables["patch"]["status"]}}}})
+        issue_id = variables["id"]
+        if issue_id not in self.statuses:
+            return FakeResponse({"data": {"issue": None}})
+        return FakeResponse({"data": {"issue": {"id": issue_id, "status": self.statuses[issue_id]}}})
+
+
+class SyncClosedCasesJobTests(unittest.TestCase):
+    def run_job(self, fake, cases, params=None):
+        SiemplifyJob.params = dict({"API URL": "https://api.us17.app.wiz.io/graphql", "Client ID": "id",
+                                    "Client Secret": "secret"}, **(params or {}))
+        SiemplifyJob.case_ids = list(cases)
+        SiemplifyJob.cases = cases
+        job = importlib.import_module("SyncClosedCasesToWiz")
+        with mock.patch.object(WizManager.requests.Session, "post", lambda self, *a, **k: fake.post(*a, **k)):
+            job.main()
+        return SiemplifyJob.last
+
+    def test_closes_open_wiz_issues_from_recently_closed_cases(self):
+        fake = FakeWizIssues({ISSUE_A: "OPEN", ISSUE_B: "RESOLVED"})
+        cases = {
+            "1": {"cyber_alerts": [wiz_alert(ISSUE_A), wiz_alert(ISSUE_A), wiz_alert(ISSUE_B)]},
+            "2": {"cyber_alerts": [wiz_alert("wiz_" + ISSUE_B.upper(), field="SourceGroupingIdentifier")]},
+        }
+        siemplify = self.run_job(fake, cases)
+
+        self.assertTrue(siemplify.ended)
+        self.assertEqual(siemplify.case_filter["status"], "CLOSE")
+        window = siemplify.case_filter["close_time_to_unix_time_in_ms"] - \
+            siemplify.case_filter["close_time_from_unix_time_in_ms"]
+        self.assertEqual(window, 10 * 60 * 1000)
+        self.assertEqual(fake.updates, [{"issueId": ISSUE_A, "patch": {
+            "status": "RESOLVED", "resolutionReason": "INCONCLUSIVE_THREAT",
+            "resolutionNote": "Closed via Google SecOps case 1"}}])
+
+    def test_skips_non_wiz_test_and_id_less_alerts(self):
+        fake = FakeWizIssues({ISSUE_A: "OPEN"})
+        cases = {"1": {"cyber_alerts": [
+            wiz_alert(ISSUE_A, product="CrowdStrike"),
+            wiz_alert(ISSUE_A, test_case="True"),
+            wiz_alert("not-a-uuid"),
+            {"identifier": "no-props"},
+        ]}}
+        siemplify = self.run_job(fake, cases)
+        self.assertTrue(siemplify.ended)
+        self.assertEqual(fake.updates, [])
+
+    def test_reject_status_uses_note_field(self):
+        fake = FakeWizIssues({ISSUE_A: "IN_PROGRESS"})
+        self.run_job(fake, {"7": {"cyber_alerts": [wiz_alert(ISSUE_A)]}},
+                     {"Wiz Close Status": "rejected", "Resolution Reason": "false_positive",
+                      "Lookback Minutes": "15"})
+        self.assertEqual(fake.updates[0]["patch"], {"status": "REJECTED", "resolutionReason": "FALSE_POSITIVE",
+                                                    "note": "Closed via Google SecOps case 7"})
+        window = SiemplifyJob.last.case_filter["close_time_to_unix_time_in_ms"] - \
+            SiemplifyJob.last.case_filter["close_time_from_unix_time_in_ms"]
+        self.assertEqual(window, 15 * 60 * 1000)
+
+    def test_failures_fail_the_job_after_processing_everything(self):
+        fake = FakeWizIssues({ISSUE_A: "OPEN", ISSUE_B: "OPEN"}, fail_update=(ISSUE_A,))
+        cases = {"1": {"cyber_alerts": [wiz_alert(ISSUE_A), wiz_alert(ISSUE_B)]}}
+        with self.assertRaises(Exception) as ctx:
+            self.run_job(fake, cases)
+        self.assertIn(ISSUE_A, str(ctx.exception))
+        self.assertEqual([u["issueId"] for u in fake.updates], [ISSUE_B])
+        self.assertFalse(SiemplifyJob.last.ended)
 
 
 if __name__ == "__main__":
