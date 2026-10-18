@@ -47,7 +47,29 @@ query EntityIssues($filterBy: IssueFilters, $first: Int) {
 }
 """
 
+GET_ISSUE_QUERY = """
+query GetIssue($id: ID!) {
+  issue(id: $id) {
+    id
+    status
+  }
+}
+"""
+
+UPDATE_ISSUE_MUTATION = """
+mutation UpdateIssue($issueId: ID!, $patch: UpdateIssuePatch) {
+  updateIssue(input: {id: $issueId, patch: $patch}) {
+    issue {
+      id
+      status
+      resolutionReason
+    }
+  }
+}
+"""
+
 OPEN_ISSUE_STATUSES = ["OPEN", "IN_PROGRESS"]
+CLOSED_ISSUE_STATUSES = ["RESOLVED", "REJECTED"]
 SEVERITIES = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFORMATIONAL"]
 
 
@@ -189,3 +211,24 @@ class WizManager(object):
             "by_severity": counts,
             "issues": issues.get("nodes") or [],
         }
+
+    def get_issue(self, issue_id):
+        data = self._graphql(GET_ISSUE_QUERY, {"id": issue_id})
+        issue = data.get("issue")
+        if not issue:
+            raise WizManagerError("Wiz issue {} was not found".format(issue_id))
+        return issue
+
+    def close_issue(self, issue_id, status="RESOLVED", resolution_reason=None, note=None):
+        """Set an issue to RESOLVED or REJECTED. Wiz stores the note as resolutionNote for RESOLVED and note for REJECTED."""
+        status = status.upper()
+        if status not in CLOSED_ISSUE_STATUSES:
+            raise WizManagerError("Unsupported close status {}, expected one of {}".format(
+                status, ", ".join(CLOSED_ISSUE_STATUSES)))
+        patch = {"status": status}
+        if resolution_reason:
+            patch["resolutionReason"] = resolution_reason
+        if note:
+            patch["resolutionNote" if status == "RESOLVED" else "note"] = note
+        data = self._graphql(UPDATE_ISSUE_MUTATION, {"issueId": issue_id, "patch": patch})
+        return ((data.get("updateIssue") or {}).get("issue")) or {}
