@@ -1,6 +1,6 @@
 # WizEnrichment – Google SecOps custom integration
 
-A Google SecOps (SOAR) custom integration with two actions and one job:
+A Google SecOps (SOAR) custom integration with two actions and one job. The CrowdStrike counterpart of the sync job lives in [`CrowdStrikeSync/`](CrowdStrikeSync/README.md).
 
 | Action | What it does |
 |---|---|
